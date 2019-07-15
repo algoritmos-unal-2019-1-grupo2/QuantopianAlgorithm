@@ -3,36 +3,36 @@ This algorithm demonstrates the concept of long-short equity. It uses a
 combination of factors to construct a ranking of securities in a liquid
 tradable universe. It then goes long on the highest-ranked securities and short
 on the lowest-ranked securities.
-
+ 
 For information on long-short equity strategies, please see the corresponding
 lecture on our lectures page:
-
+ 
 https://www.quantopian.com/lectures
-
+ 
 This algorithm was developed as part of Quantopian's Lecture Series. Please
 direct and questions, feedback, or corrections to feedback@quantopian.com
 """
-
+ 
 import quantopian.algorithm as algo
 import quantopian.optimize as opt
 from quantopian.pipeline import Pipeline
 from quantopian.pipeline.factors import SimpleMovingAverage
-
+ 
 from quantopian.pipeline.filters import QTradableStocksUS
 from quantopian.pipeline.experimental import risk_loading_pipeline
-
+ 
 from quantopian.pipeline.data.psychsignal import stocktwits
 from quantopian.pipeline.data import Fundamentals
-
+ 
 from quantopian.pipeline.data.morningstar import Fundamentals as FundaMorningstar
 from quantopian.pipeline.data import EquityPricing
 from quantopian.pipeline.data.factset import Fundamentals as FundaFactset
-from quantopian.pipeline.data.psychsignal import twitter_withretweets as twitter_sentiment
 
+ 
 # Constraint Parameters
 MAX_GROSS_LEVERAGE = 1.0
 TOTAL_POSITIONS = 600
-
+ 
 # Here we define the maximum position size that can be held for any
 # given stock. If you have a different idea of what these maximum
 # sizes should be, feel free to change them. Keep in mind that the
@@ -40,14 +40,14 @@ TOTAL_POSITIONS = 600
 # maximum is too small, the optimizer may be overly-constrained.
 MAX_SHORT_POSITION_SIZE = 2.0 / TOTAL_POSITIONS
 MAX_LONG_POSITION_SIZE = 2.0 / TOTAL_POSITIONS
-
-
+ 
+ 
 def initialize(context):
     """
     A core function called automatically once at the beginning of a backtest.
-
+ 
     Use this function for initializing state or other bookkeeping.
-
+ 
     Parameters
     ----------
     context : AlgorithmContext
@@ -59,33 +59,33 @@ def initialize(context):
     """
     
     algo.attach_pipeline(make_pipeline(), 'long_short_equity_template')
-
+ 
     # Attach the pipeline for the risk model factors that we
     # want to neutralize in the optimization step. The 'risk_factors' string is 
     # used to retrieve the output of the pipeline in before_trading_start below.
     algo.attach_pipeline(risk_loading_pipeline(), 'risk_factors')
-
+ 
     # Schedule our rebalance function
     algo.schedule_function(func=rebalance,
                            date_rule=algo.date_rules.week_start(),
                            time_rule=algo.time_rules.market_open(hours=0, minutes=30),
                            half_days=True)
-
+ 
     # Record our portfolio variables at the end of day
     algo.schedule_function(func=record_vars,
                            date_rule=algo.date_rules.every_day(),
                            time_rule=algo.time_rules.market_close(),
                            half_days=True)
-
-
+ 
+ 
 def make_pipeline():
     """
     A function that creates and returns our pipeline.
-
+ 
     We break this piece of logic out into its own function to make it easier to
     test and modify in isolation. In particular, this function can be
     copy/pasted into research and run by itself.
-
+ 
     Returns
     -------
     pipe : Pipeline
@@ -94,18 +94,17 @@ def make_pipeline():
     """
     # The factors we create here are based on fundamentals data and a moving
     # average of sentiment data
-    positive_sentiment_pct = (
-        twitter_sentiment.bull_scored_messages.latest
-        / twitter_sentiment.total_scanned_messages.latest
-    )
-    
     total_revenue = FundaMorningstar.total_revenue.latest
     
     yesterday_close = EquityPricing.close.latest
     yesterday_volume = EquityPricing.volume.latest
-    yesterday = yesterday_volume/yesterday_close
+    yesterday = yesterday_close/yesterday_volume
     
     quarterly_sales = FundaFactset.sales_qf.latest
+    
+    
+    amortization_income = FundaMorningstar.amortization_income_statement.latest    
+    administrative_expense = FundaMorningstar.administrative_expense.latest
     
     value = Fundamentals.ebit.latest / Fundamentals.enterprise_value.latest
     quality = Fundamentals.roe.latest
@@ -113,21 +112,22 @@ def make_pipeline():
         inputs=[stocktwits.bull_minus_bear],
         window_length=3,
     )
-
+ 
     universe = QTradableStocksUS()
     
     # We winsorize our factor values in order to lessen the impact of outliers
     # For more information on winsorization, please see
     # https://en.wikipedia.org/wiki/Winsorizing
-    total_revenue_winsorized =  total_revenue.winsorize(min_percentile=0.05, max_percentile=0.85)
-    yesterday_winsorize = yesterday.winsorize(min_percentile=0.05, max_percentile=0.85)
-    quarterly_sales_winsorize = quarterly_sales.winsorize(min_percentile=0.05, max_percentile=0.85)
-    positive_sentiment_pct_winsorize = positive_sentiment_pct.winsorize(min_percentile=0.05, max_percentile=0.95)
+    total_revenue_winsorized =  total_revenue.winsorize(min_percentile=0.05, max_percentile=0.95)
+    yesterday_winsorize = yesterday.winsorize(min_percentile=0.05, max_percentile=0.95)
+    quarterly_sales_winsorize = quarterly_sales.winsorize(min_percentile=0.05, max_percentile=0.95)
+    amortization_winsorize =  amortization_income.winsorize(min_percentile=0.05, max_percentile=0.95)
+    administrative_expense_winsorize = administrative_expense.winsorize(min_percentile=0.05, max_percentile=0.95)
     
     value_winsorized = value.winsorize(min_percentile=0.05, max_percentile=0.95)
     quality_winsorized = quality.winsorize(min_percentile=0.05, max_percentile=0.95)
     sentiment_score_winsorized = sentiment_score.winsorize(min_percentile=0.05,                                                                             max_percentile=0.95)
-
+ 
     # Here we combine our winsorized factors, z-scoring them to equalize their influence
     combined_factor = (
         value_winsorized.zscore() + 
@@ -136,19 +136,20 @@ def make_pipeline():
         total_revenue_winsorized.zscore() + 
         yesterday_winsorize.zscore() +
         quarterly_sales_winsorize.zscore()+
-        positive_sentiment_pct_winsorize.zscore()
+        administrative_expense_winsorize.zscore() +
+        amortization_winsorize.zscore()         
     )
-
+ 
     # Build Filters representing the top and bottom baskets of stocks by our
     # combined ranking system. We'll use these as our tradeable universe each
     # day.
     longs = combined_factor.top(TOTAL_POSITIONS//2, mask=universe)
     shorts = combined_factor.bottom(TOTAL_POSITIONS//2, mask=universe)
-
+ 
     # The final output of our pipeline should only include
     # the top/bottom 300 stocks by our criteria
     long_short_screen = (longs | shorts)
-
+ 
     # Create pipeline
     pipe = Pipeline(
         columns={
@@ -159,12 +160,12 @@ def make_pipeline():
         screen=long_short_screen
     )
     return pipe
-
-
+ 
+ 
 def before_trading_start(context, data):
     """
     Optional core function called automatically before the open of each market day.
-
+ 
     Parameters
     ----------
     context : AlgorithmContext
@@ -178,16 +179,16 @@ def before_trading_start(context, data):
     # securities to pass my screen and the columns are the factors
     # added to the pipeline object above
     context.pipeline_data = algo.pipeline_output('long_short_equity_template')
-
+ 
     # This dataframe will contain all of our risk loadings
     context.risk_loadings = algo.pipeline_output('risk_factors')
-
-
+ 
+ 
 def record_vars(context, data):
     """
     A function scheduled to run every day at market close in order to record
     strategy information.
-
+ 
     Parameters
     ----------
     context : AlgorithmContext
@@ -197,15 +198,15 @@ def record_vars(context, data):
     """
     # Plot the number of positions over time.
     algo.record(num_positions=len(context.portfolio.positions))
-
-
+ 
+ 
 # Called at the start of every month in order to rebalance
 # the longs and shorts lists
 def rebalance(context, data):
     """
     A function scheduled to run once every Monday at 10AM ET in order to
     rebalance the longs and shorts lists.
-
+ 
     Parameters
     ----------
     context : AlgorithmContext
@@ -215,24 +216,24 @@ def rebalance(context, data):
     """
     # Retrieve pipeline output
     pipeline_data = context.pipeline_data
-
+ 
     risk_loadings = context.risk_loadings
-
+ 
     # Here we define our objective for the Optimize API. We have
     # selected MaximizeAlpha because we believe our combined factor
     # ranking to be proportional to expected returns. This routine
     # will optimize the expected return of our algorithm, going
     # long on the highest expected return and short on the lowest.
     objective = opt.MaximizeAlpha(pipeline_data.combined_factor)
-
+ 
     # Define the list of constraints
     constraints = []
     # Constrain our maximum gross leverage
     constraints.append(opt.MaxGrossExposure(MAX_GROSS_LEVERAGE))
-
+ 
     # Require our algorithm to remain dollar neutral
     constraints.append(opt.DollarNeutral())
-
+ 
     # Add the RiskModelExposure constraint to make use of the
     # default risk model constraints
     neutralize_risk_factors = opt.experimental.RiskModelExposure(
@@ -240,7 +241,7 @@ def rebalance(context, data):
         version=0
     )
     constraints.append(neutralize_risk_factors)
-
+ 
     # With this constraint we enforce that no position can make up
     # greater than MAX_SHORT_POSITION_SIZE on the short side and
     # no greater than MAX_LONG_POSITION_SIZE on the long side. This
@@ -251,7 +252,7 @@ def rebalance(context, data):
             min=-MAX_SHORT_POSITION_SIZE,
             max=MAX_LONG_POSITION_SIZE
         ))
-
+ 
     # Put together all the pieces we defined above by passing
     # them into the algo.order_optimal_portfolio function. This handles
     # all of our ordering logic, assigning appropriate weights
